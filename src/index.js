@@ -40,11 +40,13 @@ import {
   restoreUserFromToken,
   seedAdminUser,
   seedDemoUser,
+  syncUserSnapshot,
   uid,
   updateOrder,
   updateUser,
   upsertDevice,
 } from "./db.js";
+import { durableGithubEnabled } from "./durableGithub.js";
 import {
   mailStatus,
   sendAccountUpdateEmail,
@@ -225,6 +227,7 @@ app.get("/api/health", (_req, res) => {
     dbError: dbBoot?.error || null,
     users: listUsers().length,
     firestoreFlag: String(process.env.USE_FIRESTORE || "").trim() === "1",
+    githubDurable: durableGithubEnabled(),
     razorpay: razorpayPublicConfig(),
     firebase: firebaseStatus(),
     mail: mailStatus(),
@@ -765,6 +768,14 @@ app.delete("/api/admin/dealers/:userId", adminAuth, async (req, res) => {
 
 app.get("/api/me", auth, (req, res) => {
   res.json(publicUser(req.user));
+});
+
+/** Merge phone-cached orders/addresses after Render memory wipe */
+app.post("/api/me/sync", auth, (req, res) => {
+  const snapshot = req.body ?? {};
+  const user = syncUserSnapshot(req.user.id, snapshot);
+  if (!user) return res.status(404).json({ error: "Account not found" });
+  res.json(publicUser(user));
 });
 
 app.patch("/api/me", auth, (req, res) => {

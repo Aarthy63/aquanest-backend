@@ -3,6 +3,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import bcrypt from "bcryptjs";
 import { firestoreEnabled, getFirestore } from "./firestore.js";
+import {
+  durableGithubEnabled,
+  loadDurableGithub,
+  saveDurableGithub,
+} from "./durableGithub.js";
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(dir, "..", "data");
@@ -24,14 +29,33 @@ function load() {
 }
 
 let state = load();
-let firestoreSaveTimer = null;
+let persistTimer = null;
+let githubSha = null;
+
+function snapshotPayload() {
+  return {
+    users: state.users || [],
+    socialPosts: state.socialPosts || [],
+    next: state.next || { user: 1 },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyRemote(remote) {
+  if (!remote || typeof remote !== "object") return;
+  state = {
+    ...empty(),
+    users: Array.isArray(remote.users) ? remote.users : [],
+    socialPosts: Array.isArray(remote.socialPosts) ? remote.socialPosts : [],
+    next: remote.next || { user: 1 },
+  };
+}
 
 function writeLocal() {
   try {
     if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
     writeFileSync(file, JSON.stringify(state, null, 2));
   } catch (err) {
-    // Render ephemeral disk may fail ??? Firestore is the source of truth there
     console.warn("[db] local save skipped:", err.message);
   }
 }
@@ -40,73 +64,140 @@ async function persistFirestore() {
   if (!firestoreEnabled()) return;
   const db = await getFirestore();
   if (!db) return;
-  const payload = {
-    users: state.users || [],
-    socialPosts: state.socialPosts || [],
-    next: state.next || { user: 1 },
-    updatedAt: new Date().toISOString(),
-  };
-  await db.collection("meta").doc("store").set(payload, { merge: false });
+  await db.collection("meta").doc("store").set(snapshotPayload(), { merge: false });
+}
+
+async function persistGithub() {
+  if (!durableGithubEnabled()) return;
+  const result = await saveDurableGithub(snapshotPayload(), githubSha);
+  if (result?.sha) githubSha = result.sha;
 }
 
 function save() {
   writeLocal();
-  if (!firestoreEnabled()) return;
-  clearTimeout(firestoreSaveTimer);
-  firestoreSaveTimer = setTimeout(() => {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
     persistFirestore().catch((err) => console.warn("[db] firestore save:", err.message));
-  }, 250);
+    persistGithub().catch((err) => console.warn("[db] github save:", err.message));
+  }, 400);
 }
 
-/** Flush pending Firestore write immediately (call after seeds / critical boot). */
+/** Flush durable writes immediately (boot / critical). */
 export async function flushDb() {
-  if (!firestoreEnabled()) return { ok: true, mode: "local" };
-  clearTimeout(firestoreSaveTimer);
-  firestoreSaveTimer = null;
-  try {
-    await persistFirestore();
-    return { ok: true, mode: "firestore" };
-  } catch (err) {
-    console.warn("[db] flush failed:", err.message);
-    return { ok: false, error: err.message };
+  clearTimeout(persistTimer);
+  persistTimer = null;
+  writeLocal();
+  const out = { ok: true, firestore: false, github: false };
+  if (firestoreEnabled()) {
+    try {
+      await persistFirestore();
+      out.firestore = true;
+    } catch (err) {
+      console.warn("[db] flush firestore:", err.message);
+    }
   }
+  if (durableGithubEnabled()) {
+    try {
+      await persistGithub();
+      out.github = true;
+    } catch (err) {
+      console.warn("[db] flush github:", err.message);
+    }
+  }
+  return out;
 }
 
 /**
- * Call once at boot (after Firebase init). Loads durable state from Firestore on Render.
+ * Boot hydrate: Firestore → GitHub durable → local store.json
  */
 export async function initDb() {
   state = load();
-  if (!firestoreEnabled()) {
-    console.log(`[db] local store.json ?? users=${state.users?.length || 0}`);
-    return { mode: "local", users: state.users?.length || 0 };
-  }
-  try {
-    const db = await getFirestore();
-    if (!db) {
-      console.warn("[db] USE_FIRESTORE=1 but Firestore unavailable ??? local only");
-      return { mode: "local-fallback", users: state.users?.length || 0 };
+
+  // 1) Firestore
+  if (firestoreEnabled()) {
+    try {
+      const db = await getFirestore();
+      if (db) {
+        const snap = await db.collection("meta").doc("store").get();
+        if (snap.exists) {
+          applyRemote(snap.data());
+          writeLocal();
+          console.log(`[db] Firestore hydrate · users=${state.users.length}`);
+          return { mode: "firestore", users: state.users.length };
+        }
+      }
+    } catch (err) {
+      console.warn("[db] Firestore hydrate failed:", err.message);
     }
-    const snap = await db.collection("meta").doc("store").get();
-    if (snap.exists) {
-      const remote = snap.data() || {};
-      state = {
-        ...empty(),
-        users: Array.isArray(remote.users) ? remote.users : [],
-        socialPosts: Array.isArray(remote.socialPosts) ? remote.socialPosts : [],
-        next: remote.next || { user: 1 },
-      };
-      writeLocal();
-      console.log(`[db] Firestore hydrate ?? users=${state.users.length} ?? posts=${state.socialPosts.length}`);
-      return { mode: "firestore", users: state.users.length };
-    }
-    await persistFirestore();
-    console.log(`[db] Firestore store created ?? users=${state.users?.length || 0}`);
-    return { mode: "firestore-seed", users: state.users?.length || 0 };
-  } catch (err) {
-    console.warn("[db] Firestore hydrate failed:", err.message);
-    return { mode: "local-error", users: state.users?.length || 0, error: err.message };
   }
+
+  // 2) GitHub durable branch (works when Firestore API is disabled)
+  if (durableGithubEnabled()) {
+    try {
+      const remote = await loadDurableGithub();
+      if (remote?.data?.users) {
+        applyRemote(remote.data);
+        githubSha = remote.sha;
+        writeLocal();
+        console.log(`[db] GitHub hydrate · users=${state.users.length}`);
+        return { mode: "github", users: state.users.length };
+      }
+      githubSha = remote?.sha || null;
+      await persistGithub();
+      console.log(`[db] GitHub store created · users=${state.users.length}`);
+      return { mode: "github-seed", users: state.users.length };
+    } catch (err) {
+      console.warn("[db] GitHub hydrate failed:", err.message);
+      return { mode: "github-error", users: state.users.length, error: err.message };
+    }
+  }
+
+  console.log(`[db] local store.json · users=${state.users.length}`);
+  return { mode: firestoreEnabled() ? "local-error" : "local", users: state.users.length };
+}
+
+function mergeById(serverList = [], clientList = []) {
+  const map = new Map();
+  for (const item of serverList) {
+    if (item?.id) map.set(String(item.id), item);
+  }
+  for (const item of clientList) {
+    if (!item?.id) continue;
+    const id = String(item.id);
+    const prev = map.get(id);
+    if (!prev) {
+      map.set(id, item);
+      continue;
+    }
+    const pt = new Date(prev.updatedAt || prev.createdAt || 0).getTime();
+    const ct = new Date(item.updatedAt || item.createdAt || 0).getTime();
+    map.set(id, ct >= pt ? { ...prev, ...item } : prev);
+  }
+  return [...map.values()].sort((a, b) => {
+    const at = new Date(b.createdAt || 0).getTime();
+    const bt = new Date(a.createdAt || 0).getTime();
+    return at - bt;
+  });
+}
+
+/** Merge APK-cached orders/addresses back after Render wipe. */
+export function syncUserSnapshot(userId, snapshot = {}) {
+  const user = findUserById(userId);
+  if (!user) return null;
+  const next = updateUser(userId, (u) => ({
+    ...u,
+    name: snapshot.name?.trim() || u.name,
+    phone: snapshot.phone != null && String(snapshot.phone).trim() !== "" ? String(snapshot.phone) : u.phone,
+    cart: Array.isArray(snapshot.cart) ? snapshot.cart : u.cart,
+    wishlist: Array.isArray(snapshot.wishlist)
+      ? [...new Set([...(u.wishlist || []), ...snapshot.wishlist])]
+      : u.wishlist,
+    addresses: mergeById(u.addresses, snapshot.addresses),
+    orders: mergeById(u.orders, snapshot.orders),
+    bookings: mergeById(u.bookings, snapshot.bookings),
+    notifications: mergeById(u.notifications, snapshot.notifications).slice(0, 80),
+  }));
+  return next;
 }
 
 function uid(prefix) {
@@ -190,7 +281,7 @@ export function restoreUserFromToken(payload) {
     state.next = { ...(state.next || {}), user: n + 1 };
   }
   save();
-  console.log(`[db] restored user from token Â· ${user.email} Â· ${user.id}`);
+  console.log(`[db] restored user from token ÃÂ· ${user.email} ÃÂ· ${user.id}`);
   return user;
 }
 
@@ -212,7 +303,7 @@ export async function recreateCustomerFromLogin({ email, password, name, phone }
   });
   state.users.push(user);
   save();
-  console.log(`[db] recreated customer after wipe · ${user.email} · ${user.id}`);
+  console.log(`[db] recreated customer after wipe Â· ${user.email} Â· ${user.id}`);
   return user;
 }
 
@@ -243,7 +334,7 @@ export async function createUser({ name, email, phone, password, role, dealer })
       id: uid("N"),
       createdAt: new Date().toISOString(),
       title: "Dealer application received",
-      body: "We'll review your business details within 24â48 hours.",
+      body: "We'll review your business details within 24Ã¢ÂÂ48 hours.",
       kind: "dealer",
       read: false,
     });
