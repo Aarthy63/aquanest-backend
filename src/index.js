@@ -40,13 +40,11 @@ import {
   restoreUserFromToken,
   seedAdminUser,
   seedDemoUser,
-  syncUserSnapshot,
   uid,
   updateOrder,
   updateUser,
   upsertDevice,
 } from "./db.js";
-import { durableGithubEnabled } from "./durableGithub.js";
 import {
   mailStatus,
   sendAccountUpdateEmail,
@@ -227,7 +225,6 @@ app.get("/api/health", (_req, res) => {
     dbError: dbBoot?.error || null,
     users: listUsers().length,
     firestoreFlag: String(process.env.USE_FIRESTORE || "").trim() === "1",
-    githubDurable: durableGithubEnabled(),
     razorpay: razorpayPublicConfig(),
     firebase: firebaseStatus(),
     mail: mailStatus(),
@@ -770,14 +767,6 @@ app.get("/api/me", auth, (req, res) => {
   res.json(publicUser(req.user));
 });
 
-/** Merge phone-cached orders/addresses after Render memory wipe */
-app.post("/api/me/sync", auth, (req, res) => {
-  const snapshot = req.body ?? {};
-  const user = syncUserSnapshot(req.user.id, snapshot);
-  if (!user) return res.status(404).json({ error: "Account not found" });
-  res.json(publicUser(user));
-});
-
 app.patch("/api/me", auth, (req, res) => {
   const { name, phone } = req.body ?? {};
   const user = updateUser(req.user.id, (u) => ({
@@ -922,19 +911,95 @@ app.post("/api/orders", auth, async (req, res) => {
       ...u.notifications,
     ],
   }));
-  let mail = { ok: false };
-  try {
-    mail = await sendOrderEmail(user, order);
-  } catch (e) {
-    console.warn("[mail] order failed", e.message);
-    mail = { ok: false, error: e.message };
-  }
+  // Never await SMTP — it made APK payment confirmation very slow
+  sendOrderEmail(user, order).catch((e) => console.warn("[mail] order failed", e.message));
   notifyUser(user, {
     title: "Order confirmed",
     body: `Order #${order.id} · ₹${order.total}`,
     data: { kind: "order", orderId: order.id },
   }).catch(() => {});
-  res.status(201).json({ ...order, status: orderStatus(order), cart: cartView(user), mail });
+  res.status(201).json({ ...order, status: orderStatus(order), cart: cartView(user), mail: { queued: true } });
+});
+
+/** One round-trip after Razorpay: verify payment + place order (faster APK checkout) */
+app.post("/api/orders/place-paid", auth, async (req, res) => {
+  try {
+    const {
+      addressId,
+      paymentMethod,
+      paymentRef,
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = req.body ?? {};
+
+    if (razorpay_order_id && razorpay_payment_id) {
+      const ok = verifyRazorpayPayment({
+        orderId: razorpay_order_id,
+        paymentId: razorpay_payment_id,
+        signature: razorpay_signature || "",
+      });
+      if (!ok) return res.status(400).json({ error: "Payment verification failed" });
+    }
+
+    const address = req.user.addresses.find((a) => a.id === addressId);
+    if (!address) return res.status(400).json({ error: "Select a delivery address" });
+    if (!req.user.cart.length) return res.status(400).json({ error: "Cart is empty" });
+
+    const dealer = isApprovedDealer(req.user);
+    const lines = req.user.cart
+      .map((l) => ({ product: getProduct(l.productId), qty: l.qty }))
+      .filter((l) => l.product);
+    const totals = cartTotals(lines, dealer);
+    const payId = razorpay_payment_id || paymentRef || "paid";
+    const order = {
+      id: uid("AN"),
+      createdAt: new Date().toISOString(),
+      items: lines.map((l) => ({
+        productId: l.product.id,
+        name: l.product.name,
+        image: l.product.image,
+        qty: l.qty,
+        unitPrice: unitPrice(l.product, dealer),
+      })),
+      subtotal: totals.subtotal,
+      delivery: totals.delivery,
+      total: totals.total,
+      address,
+      paymentMethod: paymentMethod || "Razorpay",
+      paymentRef: payId,
+      razorpayOrderId: razorpay_order_id || null,
+      isDealerOrder: dealer,
+      cancelled: false,
+    };
+    const user = updateUser(req.user.id, (u) => ({
+      ...u,
+      orders: [order, ...u.orders],
+      cart: [],
+      notifications: [
+        {
+          id: uid("N"),
+          createdAt: new Date().toISOString(),
+          title: "Payment successful",
+          body: `Order #${order.id} · ₹${order.total} · Ref ${payId}`,
+          kind: "order",
+          read: false,
+        },
+        ...u.notifications,
+      ],
+    }));
+
+    sendOrderEmail(user, order).catch((e) => console.warn("[mail] order failed", e.message));
+    notifyUser(user, {
+      title: "Payment successful",
+      body: `Order #${order.id} · ₹${order.total}`,
+      data: { kind: "order", orderId: order.id },
+    }).catch(() => {});
+
+    res.status(201).json({ ...order, status: orderStatus(order), cart: cartView(user), mail: { queued: true } });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || "Could not place order" });
+  }
 });
 
 app.post("/api/orders/:id/cancel", auth, (req, res) => {

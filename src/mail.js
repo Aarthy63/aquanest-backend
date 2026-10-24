@@ -229,12 +229,19 @@ export async function sendOrderEmail(user, order) {
   const paymentRef = order.paymentRef || "—";
   const paymentMethod = order.paymentMethod || "Razorpay";
   const items = Array.isArray(order.items) ? order.items : [];
+  const paid =
+    paymentRef &&
+    paymentRef !== "COD" &&
+    !String(paymentMethod).toUpperCase().includes("COD");
 
   const text = [
     `Hi ${name},`,
     ``,
-    `Order #${order.id} is confirmed for ${total}.`,
+    paid ? `Payment received and order #${order.id} is confirmed for ${total}.` : `Order #${order.id} is confirmed for ${total}.`,
+    `Payment method: ${paymentMethod}`,
     `Payment ref: ${paymentRef}`,
+    ``,
+    ...items.map((item) => `• ${item.name || item.productId} × ${item.qty} — ${formatINR((item.unitPrice || 0) * (item.qty || 1))}`),
     ``,
     `Track it anytime in My orders.`,
     ``,
@@ -254,13 +261,18 @@ export async function sendOrderEmail(user, order) {
   const bodyHtml = `
     <p style="margin:0 0 14px;font-size:16px;line-height:1.5;color:#122a36;">Hi <strong>${escapeHtml(name)}</strong>,</p>
     <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#3d5561;">
-      Order <strong>#${escapeHtml(order.id)}</strong> is confirmed for <strong>${escapeHtml(total)}</strong>.
+      ${
+        paid
+          ? `Your <strong>payment was successful</strong> and order <strong>#${escapeHtml(order.id)}</strong> is confirmed for <strong>${escapeHtml(total)}</strong>.`
+          : `Order <strong>#${escapeHtml(order.id)}</strong> is confirmed for <strong>${escapeHtml(total)}</strong>.`
+      }
     </p>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 18px;background:#f4fafc;border-radius:16px;border:1px solid #d5e3e9;padding:4px 16px;">
       ${detailRow("Order ID", `#${escapeHtml(order.id)}`)}
-      ${detailRow("Amount", `<span style="color:#1b7c98;">${escapeHtml(total)}</span>`)}
-      ${detailRow("Payment", escapeHtml(paymentMethod))}
+      ${detailRow("Amount paid", `<span style="color:#1b7c98;">${escapeHtml(total)}</span>`)}
+      ${detailRow("Payment method", escapeHtml(paymentMethod))}
       ${detailRow("Payment ref", `<span style="font-family:Consolas,monospace;font-size:12px;">${escapeHtml(paymentRef)}</span>`)}
+      ${order.razorpayOrderId ? detailRow("Razorpay order", `<span style="font-family:Consolas,monospace;font-size:12px;">${escapeHtml(order.razorpayOrderId)}</span>`) : ""}
     </table>
     ${
       items.length
@@ -273,11 +285,15 @@ export async function sendOrderEmail(user, order) {
 
   return sendMail({
     to: intended,
-    subject: `Order confirmed #${order.id}`,
+    subject: paid
+      ? `Payment successful · Order #${order.id} · ${total}`
+      : `Order confirmed #${order.id} · ${total}`,
     text,
     html: emailLayout({
-      title: "Order confirmed",
-      preheader: `Order #${order.id} confirmed for ${total}`,
+      title: paid ? "Payment successful" : "Order confirmed",
+      preheader: paid
+        ? `Payment received for order #${order.id} — ${total}`
+        : `Order #${order.id} confirmed for ${total}`,
       intended: process.env.MAIL_REDIRECT_TO ? intended : null,
       bodyHtml,
     }),
