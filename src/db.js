@@ -190,7 +190,29 @@ export function restoreUserFromToken(payload) {
     state.next = { ...(state.next || {}), user: n + 1 };
   }
   save();
-  console.log(`[db] restored user from token · ${user.email} · ${user.id}`);
+  console.log(`[db] restored user from token Â· ${user.email} Â· ${user.id}`);
+  return user;
+}
+
+/**
+ * After Render restarts, in-memory users are gone. Recreate a customer so the
+ * same email/password from the APK can sign in again.
+ */
+export async function recreateCustomerFromLogin({ email, password, name, phone }) {
+  const normalized = String(email || "").trim().toLowerCase();
+  const existing = findUserByEmail(normalized);
+  if (existing) return existing;
+  const user = newAccount({
+    id: `U${state.next.user++}`,
+    name: String(name || normalized.split("@")[0] || "AquaNest User").trim() || "AquaNest User",
+    email: normalized,
+    phone: phone ?? "",
+    role: "customer",
+    passwordHash: await bcrypt.hash(String(password), 10),
+  });
+  state.users.push(user);
+  save();
+  console.log(`[db] recreated customer after wipe · ${user.email} · ${user.id}`);
   return user;
 }
 
@@ -221,7 +243,7 @@ export async function createUser({ name, email, phone, password, role, dealer })
       id: uid("N"),
       createdAt: new Date().toISOString(),
       title: "Dealer application received",
-      body: "We'll review your business details within 24–48 hours.",
+      body: "We'll review your business details within 24â48 hours.",
       kind: "dealer",
       read: false,
     });

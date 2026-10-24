@@ -36,6 +36,7 @@ import {
   recordLogin,
   flushDb,
   initDb,
+  recreateCustomerFromLogin,
   restoreUserFromToken,
   seedAdminUser,
   seedDemoUser,
@@ -332,24 +333,36 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password, device } = req.body ?? {};
-  const normalized = String(email || "").trim().toLowerCase();
-  if (!normalized || !password) {
-    return res.status(400).json({ error: "Email and password are required" });
+  try {
+    const { email, password, device, name, phone, recover } = req.body ?? {};
+    const normalized = String(email || "").trim().toLowerCase();
+    if (!normalized || !password) {
+      return res.status(400).json({ error: "Email and password are required" });
+    }
+    let found = findUserByEmail(normalized);
+    // Render free tier wipes memory on sleep — recreate customer so APK login still works
+    if (!found) {
+      found = await recreateCustomerFromLogin({
+        email: normalized,
+        password,
+        name,
+        phone,
+      });
+    } else if (!(await bcrypt.compare(String(password), found.passwordHash))) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+    if (found.role === "admin") {
+      return res.status(403).json({ error: "Admin accounts must sign in via the admin panel" });
+    }
+    const user =
+      recordLogin(found.id, {
+        device: device || "AquaNest app",
+        ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
+      }) || found;
+    res.json({ token: sign(user, { audience: "customer" }), user: publicUser(user) });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || "Login failed" });
   }
-  const found = findUserByEmail(normalized);
-  if (!found || !(await bcrypt.compare(String(password), found.passwordHash))) {
-    return res.status(401).json({ error: "Invalid email or password" });
-  }
-  if (found.role === "admin") {
-    return res.status(403).json({ error: "Admin accounts must sign in via the admin panel" });
-  }
-  const user =
-    recordLogin(found.id, {
-      device: device || "AquaNest app",
-      ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
-    }) || found;
-  res.json({ token: sign(user, { audience: "customer" }), user: publicUser(user) });
 });
 
 app.get("/api/auth/login-history", auth, (req, res) => {
@@ -898,14 +911,19 @@ app.post("/api/orders", auth, async (req, res) => {
       ...u.notifications,
     ],
   }));
-  // Do not await mail — SMTP latency was delaying "Payment successful" in the APK
-  sendOrderEmail(user, order).catch((e) => console.warn("[mail] order failed", e.message));
+  let mail = { ok: false };
+  try {
+    mail = await sendOrderEmail(user, order);
+  } catch (e) {
+    console.warn("[mail] order failed", e.message);
+    mail = { ok: false, error: e.message };
+  }
   notifyUser(user, {
     title: "Order confirmed",
     body: `Order #${order.id} · ₹${order.total}`,
     data: { kind: "order", orderId: order.id },
   }).catch(() => {});
-  res.status(201).json({ ...order, status: orderStatus(order), cart: cartView(user), mail: { queued: true } });
+  res.status(201).json({ ...order, status: orderStatus(order), cart: cartView(user), mail });
 });
 
 app.post("/api/orders/:id/cancel", auth, (req, res) => {
