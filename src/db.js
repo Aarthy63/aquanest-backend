@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import bcrypt from "bcryptjs";
+import { firestoreEnabled, getFirestore } from "./firestore.js";
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(dir, "..", "data");
@@ -23,10 +24,89 @@ function load() {
 }
 
 let state = load();
+let firestoreSaveTimer = null;
+
+function writeLocal() {
+  try {
+    if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+    writeFileSync(file, JSON.stringify(state, null, 2));
+  } catch (err) {
+    // Render ephemeral disk may fail ??? Firestore is the source of truth there
+    console.warn("[db] local save skipped:", err.message);
+  }
+}
+
+async function persistFirestore() {
+  if (!firestoreEnabled()) return;
+  const db = await getFirestore();
+  if (!db) return;
+  const payload = {
+    users: state.users || [],
+    socialPosts: state.socialPosts || [],
+    next: state.next || { user: 1 },
+    updatedAt: new Date().toISOString(),
+  };
+  await db.collection("meta").doc("store").set(payload, { merge: false });
+}
 
 function save() {
-  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  writeFileSync(file, JSON.stringify(state, null, 2));
+  writeLocal();
+  if (!firestoreEnabled()) return;
+  clearTimeout(firestoreSaveTimer);
+  firestoreSaveTimer = setTimeout(() => {
+    persistFirestore().catch((err) => console.warn("[db] firestore save:", err.message));
+  }, 250);
+}
+
+/** Flush pending Firestore write immediately (call after seeds / critical boot). */
+export async function flushDb() {
+  if (!firestoreEnabled()) return { ok: true, mode: "local" };
+  clearTimeout(firestoreSaveTimer);
+  firestoreSaveTimer = null;
+  try {
+    await persistFirestore();
+    return { ok: true, mode: "firestore" };
+  } catch (err) {
+    console.warn("[db] flush failed:", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Call once at boot (after Firebase init). Loads durable state from Firestore on Render.
+ */
+export async function initDb() {
+  state = load();
+  if (!firestoreEnabled()) {
+    console.log(`[db] local store.json ?? users=${state.users?.length || 0}`);
+    return { mode: "local", users: state.users?.length || 0 };
+  }
+  try {
+    const db = await getFirestore();
+    if (!db) {
+      console.warn("[db] USE_FIRESTORE=1 but Firestore unavailable ??? local only");
+      return { mode: "local-fallback", users: state.users?.length || 0 };
+    }
+    const snap = await db.collection("meta").doc("store").get();
+    if (snap.exists) {
+      const remote = snap.data() || {};
+      state = {
+        ...empty(),
+        users: Array.isArray(remote.users) ? remote.users : [],
+        socialPosts: Array.isArray(remote.socialPosts) ? remote.socialPosts : [],
+        next: remote.next || { user: 1 },
+      };
+      writeLocal();
+      console.log(`[db] Firestore hydrate ?? users=${state.users.length} ?? posts=${state.socialPosts.length}`);
+      return { mode: "firestore", users: state.users.length };
+    }
+    await persistFirestore();
+    console.log(`[db] Firestore store created ?? users=${state.users?.length || 0}`);
+    return { mode: "firestore-seed", users: state.users?.length || 0 };
+  } catch (err) {
+    console.warn("[db] Firestore hydrate failed:", err.message);
+    return { mode: "local-error", users: state.users?.length || 0, error: err.message };
+  }
 }
 
 function uid(prefix) {
@@ -84,6 +164,34 @@ export function findUserByEmail(email) {
 
 export function findUserById(id) {
   return state.users.find((u) => u.id === id);
+}
+
+/**
+ * Recreate a user wiped by Render ephemeral disk from JWT restore claims.
+ * Keeps the same id/email/passwordHash so the saved APK token still works.
+ */
+export function restoreUserFromToken(payload) {
+  if (!payload?.sub || !payload?.email || !payload?.ph) return null;
+  const existing = findUserById(payload.sub) || findUserByEmail(payload.email);
+  if (existing) return existing;
+  const role = payload.role === "admin" ? "admin" : payload.role === "dealer" ? "dealer" : "customer";
+  const user = newAccount({
+    id: String(payload.sub),
+    name: payload.name || "AquaNest User",
+    email: String(payload.email).trim().toLowerCase(),
+    phone: payload.phone || "",
+    role,
+    passwordHash: String(payload.ph),
+  });
+  state.users.push(user);
+  // Keep next.user counter ahead of numeric ids when possible
+  const n = Number(String(payload.sub).replace(/^U/, ""));
+  if (Number.isFinite(n) && n >= (state.next?.user || 1)) {
+    state.next = { ...(state.next || {}), user: n + 1 };
+  }
+  save();
+  console.log(`[db] restored user from token · ${user.email} · ${user.id}`);
+  return user;
 }
 
 export async function createUser({ name, email, phone, password, role, dealer }) {
@@ -248,7 +356,7 @@ export function recordLogin(userId, { device = "AquaNest app", ip = "" } = {}) {
         id: uid("N"),
         createdAt: at,
         title: "New sign-in",
-        body: `Signed in · ${device} · ${new Date(at).toLocaleString()}`,
+        body: `Signed in ?? ${device} ?? ${new Date(at).toLocaleString()}`,
         kind: "login",
         read: false,
       },

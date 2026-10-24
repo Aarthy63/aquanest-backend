@@ -34,6 +34,9 @@ import {
   listUsers,
   publicUser,
   recordLogin,
+  flushDb,
+  initDb,
+  restoreUserFromToken,
   seedAdminUser,
   seedDemoUser,
   uid,
@@ -68,20 +71,37 @@ import {
 const PORT = Number(process.env.PORT) || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "aquanest-dev-secret-change-me";
 await ensureFirebase();
+const dbBoot = await initDb();
 configureWebPush();
 
 const app = express();
+app.set("trust proxy", 1);
 const __backendDir = dirname(fileURLToPath(import.meta.url));
 app.use(cors({ origin: true }));
 app.use(express.json());
 app.use("/media/ai-posts", express.static(join(__backendDir, "..", "data", "ai-posts")));
 
 function sign(user, { audience = "customer" } = {}) {
+  // Include restore claims so APK sessions survive Render ephemeral restarts
   return jwt.sign(
-    { sub: user.id, email: user.email, role: user.role, aud: audience },
+    {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      aud: audience,
+      name: user.name || "",
+      phone: user.phone || "",
+      ph: user.passwordHash,
+    },
     JWT_SECRET,
     { expiresIn: audience === "admin" ? "1d" : "14d" },
   );
+}
+
+function resolveAuthedUser(payload) {
+  let user = findUserById(payload.sub) || (payload.email ? findUserByEmail(payload.email) : null);
+  if (!user) user = restoreUserFromToken(payload);
+  return user;
 }
 
 function auth(req, res, next) {
@@ -90,7 +110,7 @@ function auth(req, res, next) {
   if (!token) return res.status(401).json({ error: "Sign in required" });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = findUserById(payload.sub);
+    const user = resolveAuthedUser(payload);
     if (!user) return res.status(401).json({ error: "Account not found" });
     if (user.role === "admin" && payload.aud !== "admin") {
       return res.status(401).json({ error: "Use the admin panel to sign in" });
@@ -112,7 +132,7 @@ function adminAuth(req, res, next) {
     if (payload.aud !== "admin") {
       return res.status(403).json({ error: "Admin token required" });
     }
-    const user = findUserById(payload.sub);
+    const user = resolveAuthedUser(payload);
     if (!user || user.role !== "admin") {
       return res.status(403).json({ error: "Not an admin account" });
     }
@@ -140,6 +160,10 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     service: "aquanest-api",
+    db: dbBoot?.mode || "local",
+    dbError: dbBoot?.error || null,
+    users: listUsers().length,
+    firestoreFlag: String(process.env.USE_FIRESTORE || "").trim() === "1",
     razorpay: razorpayPublicConfig(),
     firebase: firebaseStatus(),
     mail: mailStatus(),
@@ -994,6 +1018,7 @@ function startDailyAiSocialSchedule() {
 
 await seedDemoUser();
 await seedAdminUser();
+await flushDb();
 const mailBoot = await verifyMail();
 startDailyAiSocialSchedule();
 
@@ -1002,6 +1027,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`AquaNest API running on http://localhost:${PORT}`);
   console.log(`  Razorpay: ${rzp.mode}${rzp.configured ? " (keys set)" : " (demo — set RAZORPAY_* in backend/.env)"}`);
   console.log(`  Firebase: ${firebaseStatus().configured ? "ready" : "optional / not configured"}`);
+  console.log(`  DB: ${dbBoot?.mode || "local"} · users=${listUsers().length}`);
   console.log(
     `  Mail: ${mailBoot.mode}${mailBoot.ok ? (mailBoot.verified ? " verified" : "") : ` ERROR — ${mailBoot.error || "check SMTP_*"}`}`,
   );
