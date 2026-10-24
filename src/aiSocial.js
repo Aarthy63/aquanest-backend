@@ -112,13 +112,28 @@ function templateCaption(product) {
   return { caption: lines.join("\n"), hashtags: [...baseTags, ...extras] };
 }
 
+/** Skip OpenAI after billing/quota errors so logs stay clean. */
+let openaiDisabledReason = null;
+
+function openaiEnabled() {
+  if (openaiDisabledReason) return false;
+  if (String(process.env.OPENAI_AI_POSTS || "0").trim() !== "1") return false;
+  return !!process.env.OPENAI_API_KEY;
+}
+
+function disableOpenAI(reason) {
+  if (!openaiDisabledReason) {
+    openaiDisabledReason = reason;
+    console.warn(`[ai-social] OpenAI disabled for this process: ${reason}`);
+  }
+}
+
 async function openaiCaption(product) {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return null;
+  if (!openaiEnabled()) return null;
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${key}`,
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -140,7 +155,12 @@ async function openaiCaption(product) {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`OpenAI caption failed: ${res.status} ${text.slice(0, 200)}`);
+    if (res.status === 429 || /insufficient|quota|billing|credits/i.test(text)) {
+      disableOpenAI("no credits / rate limited (429)");
+      return null;
+    }
+    console.warn("[ai-social] caption skipped:", res.status);
+    return null;
   }
   const data = await res.json();
   const parsed = JSON.parse(data.choices?.[0]?.message?.content || "{}");
@@ -153,20 +173,27 @@ async function openaiCaption(product) {
 }
 
 async function openaiImage(prompt) {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return null;
-  const model = process.env.OPENAI_IMAGE_MODEL || "dall-e-2";
+  if (!openaiEnabled()) return null;
+  // Images off unless explicitly enabled (needs billed image model access)
+  if (String(process.env.OPENAI_IMAGE || "0").trim() !== "1") return null;
+
+  const model = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1";
   const res = await fetch("https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${key}`,
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ model, prompt: prompt.slice(0, 900), n: 1, size: "1024x1024" }),
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`OpenAI image failed: ${res.status} ${text.slice(0, 200)}`);
+    if (res.status === 429 || /insufficient|quota|billing|credits/i.test(text)) {
+      disableOpenAI("no credits / rate limited (429)");
+      return null;
+    }
+    console.warn("[ai-social] openai image skipped:", res.status, text.slice(0, 120));
+    return null;
   }
   const data = await res.json();
   return data.data?.[0]?.url || null;
@@ -239,34 +266,28 @@ export async function generateDailySocialPost() {
     `variation id ${seed}`,
   ].join(" ");
 
-  let captionResult;
+  let captionResult = templateCaption(product);
   try {
-    captionResult = (await openaiCaption(product)) || templateCaption(product);
-  } catch (err) {
-    console.warn("[ai-social] caption fallback:", err.message);
-    captionResult = templateCaption(product);
+    const aiCaption = await openaiCaption(product);
+    if (aiCaption?.caption) captionResult = aiCaption;
+  } catch {
+    // keep template
   }
-  if (!captionResult.caption) captionResult = templateCaption(product);
 
-  let image;
+  let image = null;
   try {
     const dalle = await openaiImage(imagePrompt);
-    if (dalle) {
-      image = await downloadToPost(dalle, seed, "openai");
-    } else {
-      try {
-        image = await pollinationsImage(imagePrompt, seed);
-      } catch (err) {
-        console.warn("[ai-social] pollinations:", err.message);
-        image = await uniqueStockImage(product, seed);
-      }
-    }
-  } catch (err) {
-    console.warn("[ai-social] image pipeline:", err.message);
-    image = await uniqueStockImage(product, seed);
+    if (dalle) image = await downloadToPost(dalle, seed, "openai");
+  } catch {
+    // ignore
   }
-
-  // Never reuse a bare catalog URL without saving a unique local file
+  if (!image) {
+    try {
+      image = await pollinationsImage(imagePrompt, seed);
+    } catch {
+      image = await uniqueStockImage(product, seed);
+    }
+  }
   if (!image?.imagePath) {
     image = await uniqueStockImage(product, seed + 99);
   }
@@ -295,8 +316,9 @@ export async function generateDailySocialPost() {
     imageLocalPath: image.localPath,
     seed,
     ai: {
-      caption: !!process.env.OPENAI_API_KEY,
+      caption: openaiEnabled(),
       image: image.source,
+      openai: openaiEnabled() ? "on" : openaiDisabledReason || "off",
     },
   };
 }
@@ -315,9 +337,18 @@ export function resolvePostImageUrl(post, req) {
   if (!post) return null;
   if (post.imagePath) {
     const host = req?.get?.("host");
-    const proto = req?.protocol || "http";
+    const proto =
+      req?.headers?.["x-forwarded-proto"] ||
+      (host && !host.includes("localhost") ? "https" : null) ||
+      req?.protocol ||
+      "http";
     if (host) return `${proto}://${host}${post.imagePath}`;
-    return `http://localhost:${process.env.PORT || 4000}${post.imagePath}`;
+    const base = (
+      process.env.APP_PUBLIC_URL ||
+      process.env.RENDER_EXTERNAL_URL ||
+      `http://localhost:${process.env.PORT || 4000}`
+    ).replace(/\/$/, "");
+    return `${base}${post.imagePath}`;
   }
   return post.imageUrl || null;
 }
@@ -340,7 +371,11 @@ export function aiSocialStatus() {
   next.setHours(hour, 0, 0, 0);
   if (next <= now) next = new Date(next.getTime() + 24 * 60 * 60 * 1000);
   return {
-    openai: !!process.env.OPENAI_API_KEY,
+    openai: openaiEnabled(),
+    openaiMode:
+      String(process.env.OPENAI_AI_POSTS || "0").trim() === "1"
+        ? openaiDisabledReason || "enabled"
+        : "template+stock (set OPENAI_AI_POSTS=1 when you have credits)",
     scheduleHour: hour,
     scheduleEnabled: String(process.env.AI_POST_SCHEDULE || "1") !== "0",
     ranToday,

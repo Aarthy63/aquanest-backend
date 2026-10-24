@@ -34,6 +34,8 @@ import {
   listUsers,
   publicUser,
   recordLogin,
+  flushDb,
+  initDb,
   seedAdminUser,
   seedDemoUser,
   uid,
@@ -68,9 +70,11 @@ import {
 const PORT = Number(process.env.PORT) || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "aquanest-dev-secret-change-me";
 await ensureFirebase();
+const dbBoot = await initDb();
 configureWebPush();
 
 const app = express();
+app.set("trust proxy", 1);
 const __backendDir = dirname(fileURLToPath(import.meta.url));
 app.use(cors({ origin: true }));
 app.use(express.json());
@@ -140,6 +144,8 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     service: "aquanest-api",
+    db: dbBoot?.mode || "local",
+    users: dbBoot?.users ?? null,
     razorpay: razorpayPublicConfig(),
     firebase: firebaseStatus(),
     mail: mailStatus(),
@@ -988,12 +994,13 @@ function startDailyAiSocialSchedule() {
   setInterval(() => tryRun("timer"), 60_000);
   const hour = Number(process.env.AI_POST_HOUR ?? 9);
   console.log(
-    `[ai-social] daily schedule on · ${hour}:00 local (catch-up if missed) · openai=${process.env.OPENAI_API_KEY ? "yes" : "fallback"}`,
+    `[ai-social] daily schedule on · ${hour}:00 local (catch-up if missed) · ${aiSocialStatus().openaiMode}`,
   );
 }
 
 await seedDemoUser();
 await seedAdminUser();
+await flushDb();
 const mailBoot = await verifyMail();
 startDailyAiSocialSchedule();
 
@@ -1002,6 +1009,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`AquaNest API running on http://localhost:${PORT}`);
   console.log(`  Razorpay: ${rzp.mode}${rzp.configured ? " (keys set)" : " (demo — set RAZORPAY_* in backend/.env)"}`);
   console.log(`  Firebase: ${firebaseStatus().configured ? "ready" : "optional / not configured"}`);
+  console.log(`  DB: ${dbBoot?.mode || "local"} · users=${dbBoot?.users ?? "?"}`);
   console.log(
     `  Mail: ${mailBoot.mode}${mailBoot.ok ? (mailBoot.verified ? " verified" : "") : ` ERROR — ${mailBoot.error || "check SMTP_*"}`}`,
   );
@@ -1009,5 +1017,7 @@ app.listen(PORT, "0.0.0.0", () => {
   const push = pushStatus();
   console.log(`  Push: VAPID ${push.vapid ? "ready" : "off"} · FCM ${push.fcm ? "ready" : "off"}`);
   const ai = aiSocialStatus();
-  console.log(`  AI posts: schedule ${ai.scheduleEnabled ? `daily ${ai.scheduleHour}:00` : "off"} · OpenAI ${ai.openai ? "on" : "template+pollinations"}`);
+  console.log(
+    `  AI posts: schedule ${ai.scheduleEnabled ? `daily ${ai.scheduleHour}:00` : "off"} · ${ai.openaiMode || (ai.openai ? "OpenAI on" : "template+stock")}`,
+  );
 });
