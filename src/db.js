@@ -104,8 +104,15 @@ export async function initDb() {
     console.log(`[db] Firestore store created · users=${state.users?.length || 0}`);
     return { mode: "firestore-seed", users: state.users?.length || 0 };
   } catch (err) {
-    console.warn("[db] Firestore hydrate failed:", err.message);
-    return { mode: "local-error", users: state.users?.length || 0, error: err.message };
+    const msg = err.message || String(err);
+    console.warn("[db] Firestore hydrate failed:", msg);
+    if (/PERMISSION_DENIED|has not been used|disabled/i.test(msg)) {
+      console.warn(
+        "[db] Enable Cloud Firestore API + create a Firestore database for project",
+        process.env.FIREBASE_PROJECT_ID || "(unknown)",
+      );
+    }
+    return { mode: "local-error", users: state.users?.length || 0, error: msg };
   }
 }
 
