@@ -156,6 +156,66 @@ function cartView(user) {
   return { items: lines, ...cartTotals(lines, dealer), isDealer: dealer };
 }
 
+app.get("/", (_req, res) => {
+  const health = {
+    ok: true,
+    service: "aquanest-api",
+    db: dbBoot?.mode || "local",
+    users: listUsers().length,
+    firebase: firebaseStatus().configured,
+    razorpay: razorpayPublicConfig().configured,
+  };
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AquaNest API</title>
+  <style>
+    :root { color-scheme: light; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: linear-gradient(160deg, #e8f6fb 0%, #f7fbfd 45%, #dff0f7 100%);
+      color: #0b3a4d;
+    }
+    main {
+      width: min(520px, 92vw); background: #fff; border-radius: 20px;
+      padding: 2rem 1.75rem; box-shadow: 0 18px 50px rgba(11, 110, 153, 0.12);
+      border: 1px solid rgba(11, 110, 153, 0.12);
+    }
+    h1 { margin: 0 0 0.35rem; font-size: 1.65rem; color: #0b6e99; }
+    p { margin: 0 0 1.1rem; line-height: 1.5; color: #355868; }
+    .ok {
+      display: inline-flex; align-items: center; gap: 0.45rem;
+      background: #e7f8ef; color: #0f7a45; font-weight: 600;
+      padding: 0.35rem 0.7rem; border-radius: 999px; font-size: 0.9rem;
+    }
+    .ok::before { content: ""; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: #19a55a; }
+    ul { margin: 0; padding-left: 1.1rem; color: #355868; }
+    li { margin: 0.35rem 0; }
+    a { color: #0b6e99; font-weight: 600; }
+    code { background: #eef6fa; padding: 0.1rem 0.35rem; border-radius: 6px; }
+    .meta { margin-top: 1.25rem; font-size: 0.88rem; color: #5a7380; }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="ok">API online</span>
+    <h1>AquaNest Backend</h1>
+    <p>This is the AquaNest API server. Open these endpoints (not just <code>/</code>):</p>
+    <ul>
+      <li><a href="/api/health">/api/health</a> — status JSON</li>
+      <li><a href="/api/products">/api/products</a> — catalog</li>
+      <li><a href="/api/categories">/api/categories</a> — categories</li>
+      <li><code>/api/auth/login</code> — app login (POST)</li>
+    </ul>
+    <p class="meta">DB: <strong>${health.db}</strong> · users: <strong>${health.users}</strong> · Firebase: <strong>${health.firebase ? "ready" : "off"}</strong> · Razorpay: <strong>${health.razorpay ? "ready" : "off"}</strong></p>
+  </main>
+</body>
+</html>`);
+});
+
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
