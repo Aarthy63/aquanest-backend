@@ -898,19 +898,14 @@ app.post("/api/orders", auth, async (req, res) => {
       ...u.notifications,
     ],
   }));
-  let mail = { ok: false };
-  try {
-    mail = await sendOrderEmail(user, order);
-  } catch (e) {
-    console.warn("[mail] order failed", e.message);
-    mail = { ok: false, error: e.message };
-  }
+  // Do not await mail — SMTP latency was delaying "Payment successful" in the APK
+  sendOrderEmail(user, order).catch((e) => console.warn("[mail] order failed", e.message));
   notifyUser(user, {
     title: "Order confirmed",
     body: `Order #${order.id} · ₹${order.total}`,
     data: { kind: "order", orderId: order.id },
   }).catch(() => {});
-  res.status(201).json({ ...order, status: orderStatus(order), cart: cartView(user), mail });
+  res.status(201).json({ ...order, status: orderStatus(order), cart: cartView(user), mail: { queued: true } });
 });
 
 app.post("/api/orders/:id/cancel", auth, (req, res) => {
