@@ -2,7 +2,6 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import bcrypt from "bcryptjs";
-import { firestoreEnabled, getFirestore } from "./firestore.js";
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(dir, "..", "data");
@@ -24,96 +23,10 @@ function load() {
 }
 
 let state = load();
-let firestoreSaveTimer = null;
-
-function writeLocal() {
-  try {
-    if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-    writeFileSync(file, JSON.stringify(state, null, 2));
-  } catch (err) {
-    // Render ephemeral disk may fail — Firestore is the source of truth there
-    console.warn("[db] local save skipped:", err.message);
-  }
-}
-
-async function persistFirestore() {
-  if (!firestoreEnabled()) return;
-  const db = await getFirestore();
-  if (!db) return;
-  const payload = {
-    users: state.users || [],
-    socialPosts: state.socialPosts || [],
-    next: state.next || { user: 1 },
-    updatedAt: new Date().toISOString(),
-  };
-  await db.collection("meta").doc("store").set(payload, { merge: false });
-}
 
 function save() {
-  writeLocal();
-  if (!firestoreEnabled()) return;
-  clearTimeout(firestoreSaveTimer);
-  firestoreSaveTimer = setTimeout(() => {
-    persistFirestore().catch((err) => console.warn("[db] firestore save:", err.message));
-  }, 250);
-}
-
-/** Flush pending Firestore write immediately (call after seeds / critical boot). */
-export async function flushDb() {
-  if (!firestoreEnabled()) return { ok: true, mode: "local" };
-  clearTimeout(firestoreSaveTimer);
-  firestoreSaveTimer = null;
-  try {
-    await persistFirestore();
-    return { ok: true, mode: "firestore" };
-  } catch (err) {
-    console.warn("[db] flush failed:", err.message);
-    return { ok: false, error: err.message };
-  }
-}
-
-/**
- * Call once at boot (after Firebase init). Loads durable state from Firestore on Render.
- */
-export async function initDb() {
-  state = load();
-  if (!firestoreEnabled()) {
-    console.log(`[db] local store.json · users=${state.users?.length || 0}`);
-    return { mode: "local", users: state.users?.length || 0 };
-  }
-  try {
-    const db = await getFirestore();
-    if (!db) {
-      console.warn("[db] USE_FIRESTORE=1 but Firestore unavailable — local only");
-      return { mode: "local-fallback", users: state.users?.length || 0 };
-    }
-    const snap = await db.collection("meta").doc("store").get();
-    if (snap.exists) {
-      const remote = snap.data() || {};
-      state = {
-        ...empty(),
-        users: Array.isArray(remote.users) ? remote.users : [],
-        socialPosts: Array.isArray(remote.socialPosts) ? remote.socialPosts : [],
-        next: remote.next || { user: 1 },
-      };
-      writeLocal();
-      console.log(`[db] Firestore hydrate · users=${state.users.length} · posts=${state.socialPosts.length}`);
-      return { mode: "firestore", users: state.users.length };
-    }
-    await persistFirestore();
-    console.log(`[db] Firestore store created · users=${state.users?.length || 0}`);
-    return { mode: "firestore-seed", users: state.users?.length || 0 };
-  } catch (err) {
-    const msg = err.message || String(err);
-    console.warn("[db] Firestore hydrate failed:", msg);
-    if (/PERMISSION_DENIED|has not been used|disabled/i.test(msg)) {
-      console.warn(
-        "[db] Enable Cloud Firestore API + create a Firestore database for project",
-        process.env.FIREBASE_PROJECT_ID || "(unknown)",
-      );
-    }
-    return { mode: "local-error", users: state.users?.length || 0, error: msg };
-  }
+  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+  writeFileSync(file, JSON.stringify(state, null, 2));
 }
 
 function uid(prefix) {

@@ -1,10 +1,5 @@
-node_modules/
+node_modules
 data/store.json
-data/ai-posts/
 .env
-.env.*
-!.env.example
 firebase-service-account.json
 *.pem
-.DS_Store
-Thumbs.db

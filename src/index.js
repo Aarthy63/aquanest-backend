@@ -34,8 +34,6 @@ import {
   listUsers,
   publicUser,
   recordLogin,
-  flushDb,
-  initDb,
   seedAdminUser,
   seedDemoUser,
   uid,
@@ -70,11 +68,9 @@ import {
 const PORT = Number(process.env.PORT) || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "aquanest-dev-secret-change-me";
 await ensureFirebase();
-const dbBoot = await initDb();
 configureWebPush();
 
 const app = express();
-app.set("trust proxy", 1);
 const __backendDir = dirname(fileURLToPath(import.meta.url));
 app.use(cors({ origin: true }));
 app.use(express.json());
@@ -144,11 +140,6 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     service: "aquanest-api",
-    db: dbBoot?.mode || "local",
-    dbError: dbBoot?.error || null,
-    users: listUsers().length,
-    posts: listSocialPosts(200).length,
-    firestoreFlag: String(process.env.USE_FIRESTORE || "").trim() === "1",
     razorpay: razorpayPublicConfig(),
     firebase: firebaseStatus(),
     mail: mailStatus(),
@@ -1003,7 +994,6 @@ function startDailyAiSocialSchedule() {
 
 await seedDemoUser();
 await seedAdminUser();
-await flushDb();
 const mailBoot = await verifyMail();
 startDailyAiSocialSchedule();
 
@@ -1012,7 +1002,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`AquaNest API running on http://localhost:${PORT}`);
   console.log(`  Razorpay: ${rzp.mode}${rzp.configured ? " (keys set)" : " (demo — set RAZORPAY_* in backend/.env)"}`);
   console.log(`  Firebase: ${firebaseStatus().configured ? "ready" : "optional / not configured"}`);
-  console.log(`  DB: ${dbBoot?.mode || "local"} · users=${dbBoot?.users ?? "?"}`);
   console.log(
     `  Mail: ${mailBoot.mode}${mailBoot.ok ? (mailBoot.verified ? " verified" : "") : ` ERROR — ${mailBoot.error || "check SMTP_*"}`}`,
   );
