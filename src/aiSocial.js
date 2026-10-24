@@ -213,6 +213,10 @@ async function downloadToPost(url, seed, source) {
   return {
     localPath: filePath,
     imagePath: `/media/ai-posts/${fileName}`,
+    // Keep original CDN URL so Render redeploys don't break images
+    remoteUrl: String(url).split("?")[0].includes("pollinations.ai")
+      ? url
+      : String(url).replace(/[?&]cb=[^&]+/, "").replace(/\?$/, "") || url,
     source,
     seed,
   };
@@ -310,7 +314,7 @@ export async function generateDailySocialPost() {
     hashtags: captionResult.hashtags || [],
     fullCaption,
     imagePath: image.imagePath,
-    imageUrl: image.imagePath,
+    imageUrl: image.remoteUrl || image.imagePath,
     imagePrompt,
     imageSource: image.source,
     imageLocalPath: image.localPath,
@@ -335,6 +339,10 @@ export function removeLocalPostImage(post) {
 
 export function resolvePostImageUrl(post, req) {
   if (!post) return null;
+  // Prefer durable absolute URLs (CDN / previous resolve) over ephemeral /media on Render disk
+  if (post.imageUrl && /^https?:\/\//i.test(post.imageUrl) && !/localhost|127\.0\.0\.1/i.test(post.imageUrl)) {
+    return post.imageUrl;
+  }
   if (post.imagePath) {
     const host = req?.get?.("host");
     const proto =
@@ -344,8 +352,8 @@ export function resolvePostImageUrl(post, req) {
       "http";
     if (host) return `${proto}://${host}${post.imagePath}`;
     const base = (
-      process.env.APP_PUBLIC_URL ||
       process.env.RENDER_EXTERNAL_URL ||
+      process.env.APP_PUBLIC_URL ||
       `http://localhost:${process.env.PORT || 4000}`
     ).replace(/\/$/, "");
     return `${base}${post.imagePath}`;
